@@ -69,19 +69,25 @@ class Plotter:
 
     def plot_carbon_footprint_comparison(self, ideal_energy: float, real_energy: float):
         """
-        图 3 (柱状图): 对比理想集群与真实集群的总碳足迹(我们用总能耗代指碳足迹)
+        图 3 (柱状图): 对比理想集群与真实集群的总碳足迹(引入 Liu et al. 2025 碳排放因子)
         """
+        # [Liu et al., 2025] - Carbon Footprint conversion
+        CARBON_INTENSITY = 0.4 # kg CO2 / kWh
+
         # Convert Joules to kWh (1 kWh = 3.6e6 Joules)
         ideal_kwh = ideal_energy / 3.6e6
         real_kwh = real_energy / 3.6e6
 
+        ideal_carbon = ideal_kwh * CARBON_INTENSITY
+        real_carbon = real_kwh * CARBON_INTENSITY
+
         data = pd.DataFrame({
             'Cluster Scenario': ['Ideal Cluster', 'Real-World Cluster (Resource Mismatch)'],
-            'Total Energy (kWh)': [ideal_kwh, real_kwh]
+            'Carbon Emission (kg CO2)': [ideal_carbon, real_carbon]
         })
 
         plt.figure(figsize=(8, 6))
-        ax = plt_sns.barplot(x='Cluster Scenario', y='Total Energy (kWh)', hue='Cluster Scenario', data=data, palette='pastel', legend=False)
+        ax = plt_sns.barplot(x='Cluster Scenario', y='Carbon Emission (kg CO2)', hue='Cluster Scenario', data=data, palette='pastel', legend=False)
 
         # Add values on top of bars
         for p in ax.patches:
@@ -91,7 +97,7 @@ class Plotter:
                         xytext = (0, 9),
                         textcoords = 'offset points')
 
-        plt.title('Total Carbon Footprint (Energy Consumption) Comparison')
+        plt.title('Total Carbon Emission Comparison (Based on Liu et al. 2025)')
 
         filepath = os.path.join(self.output_dir, 'fig3_carbon_comparison.pdf')
         plt.savefig(filepath, dpi=300, bbox_inches='tight')
