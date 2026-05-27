@@ -47,12 +47,14 @@ class ClusterResourceManager:
         self.task_energies = {
             'LLM': [],
             'Diffusion': [],
-            'DLRM': []
+            'DLRM': [],
+            'Training': []
         }
         self.task_counts = {
             'LLM': 0,
             'Diffusion': 0,
-            'DLRM': 0
+            'DLRM': 0,
+            'Training': 0
         }
 
     def allocate(self, cpu_req: int, gpu_req: int) -> Optional[Node]:
@@ -90,10 +92,13 @@ class ClusterResourceManager:
             yield self.env.timeout(compute_time)
             node.active_tasks -= 1
 
+            # [León-Vega et al., 2024] - Energy slicing rule: Assign fraction of static power
+            node_fraction = max(task['gpu_req'] / node.total_gpus, task['cpu_req'] / node.total_cpus)
+
             # Record single task total energy for violin plot
-            # (Energy = P * T). Active + I/O wasted energy for this task
-            task_energy_j = (task['gpu_req'] * self.tracker.p_dynamic_gpu + self.tracker.p_static) * (compute_time / 1000.0)
-            task_energy_j += self.tracker.p_static * (io_time / 1000.0)
+            # (Energy = P * T). Active + I/O wasted energy for this task. Time is ms so divide by 1000.0
+            task_energy_j = (task['gpu_req'] * self.tracker.p_dynamic_gpu + self.tracker.p_static * node_fraction) * (compute_time / 1000.0)
+            task_energy_j += (self.tracker.p_static * node_fraction) * (io_time / 1000.0)
 
             # Reservoir sample task energies to prevent OOM
             if len(self.task_energies[task['type']]) < 100000:
