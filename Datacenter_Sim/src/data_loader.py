@@ -163,7 +163,7 @@ class PhillyParser(BaseParser):
                         try:
                             parsed_count += 1
                             if parsed_count == 1:
-                                print("  [Loader] ⚡ 首条数据已秒速解开！引擎全速推进中...")
+                                print("  [Loader] [FAST] 首条数据已秒速解开！引擎全速推进中...")
 
                             attempts = job.get('attempts', [])
                             if not attempts:
@@ -269,7 +269,7 @@ def event_generator(data_dir: str, include_dlrm: bool = True) -> Generator[Dict[
         aligned_ts, idx, item = heapq.heappop(pq)
 
         if processed_count == 0:
-            print(f"  [EventGen] ⚡ 第一条数据已成功进入归并逻辑！Idx={idx}, Time={aligned_ts}", flush=True)
+            print(f"  [EventGen] [FAST] 第一条数据已成功进入归并逻辑！Idx={idx}, Time={aligned_ts}", flush=True)
 
         processed_count += 1
         if processed_count % 10000 == 0:
