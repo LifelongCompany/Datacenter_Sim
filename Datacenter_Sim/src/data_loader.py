@@ -6,13 +6,13 @@ import heapq
 import json
 from datetime import datetime
 
+
 class BaseParser:
     def __init__(self, data_dir: str):
         self.data_dir = data_dir
         self.chunksize = 100000
 
     def get_file_path(self, pattern: str) -> Optional[str]:
-        import glob
         search_path = os.path.join(self.data_dir, pattern)
         files = glob.glob(search_path)
         if files:
@@ -25,31 +25,47 @@ class BaseParser:
 
         print(f"  [Loader] 预热加载中: {os.path.basename(filepath)} ...")
         try:
-            # 【修复1】添加 on_bad_lines='skip' 和 engine='c'，彻底无视像第34行那样的断层脏数据！
+            # 【修复1】添加 on_bad_lines='skip' 和 engine='c'，彻底无视断层脏数据！
             for chunk in pd.read_csv(filepath, chunksize=self.chunksize, on_bad_lines='skip', engine='c'):
                 yield chunk
         except Exception as e:
-            print(f"Error reading {filepath}: {e}")
+            print(f"  [Error] 读取 {filepath} 时发生错误: {e}")
 
 
 class AzureParser(BaseParser):
     def parse(self) -> Generator[Dict[str, Any], None, None]:
-        patterns = ['*AzureLLMInferenceTrace_code.csv', '*AzureLLMInferenceTrace_conv.csv']
+        # 【核心修复1】补全多模态数据集（注意微软的拼写是 LMM 不是 LLM）
+        patterns = [
+            '*AzureLLMInferenceTrace_code.csv',
+            '*AzureLLMInferenceTrace_conv.csv',
+            '*AzureLMMInferenceTrace_multimodal.csv'
+        ]
+
         for pattern in patterns:
             filepath = self.get_file_path(pattern)
             if not filepath:
                 continue
 
             for chunk in self.read_csv_in_chunks(filepath):
-                # 【极速解析】开启 cache，遇到乱码行直接跳过(coerce会转为NaT)，然后删掉无效行
+                # 【极速解析】开启 cache，遇到乱码行直接跳过，然后删掉无效行
                 chunk['TIMESTAMP'] = pd.to_datetime(chunk['TIMESTAMP'], format='mixed', cache=True, errors='coerce')
-                chunk = chunk.dropna(subset=['TIMESTAMP'])  # 丢弃坏数据
+                chunk = chunk.dropna(subset=['TIMESTAMP'])
 
                 chunk['timestamp_ms'] = chunk['TIMESTAMP'].astype('int64') // 10 ** 6
-                chunk['compute_time_ms'] = ((chunk['ContextTokens'] / 1000.0) + (
-                            chunk['GeneratedTokens'] / 50.0)) * 1000.0
 
-                # 【性能优化】弃用 iterrows()，改用极速的 itertuples()
+                # 【核心护盾】防御空值引发的算术错误，防止静默宕机
+                if 'ContextTokens' in chunk.columns:
+                    chunk['ContextTokens'] = pd.to_numeric(chunk['ContextTokens'], errors='coerce').fillna(0)
+                if 'GeneratedTokens' in chunk.columns:
+                    chunk['GeneratedTokens'] = pd.to_numeric(chunk['GeneratedTokens'], errors='coerce').fillna(0)
+
+                # 如果没有这些列，赋默认值
+                ctx_tokens = chunk['ContextTokens'] if 'ContextTokens' in chunk.columns else 0
+                gen_tokens = chunk['GeneratedTokens'] if 'GeneratedTokens' in chunk.columns else 0
+
+                chunk['compute_time_ms'] = ((ctx_tokens / 1000.0) + (gen_tokens / 50.0)) * 1000.0
+
+                # 【性能优化】极速元组遍历
                 for row in chunk.itertuples(index=False):
                     yield {
                         'type': 'LLM',
@@ -57,25 +73,22 @@ class AzureParser(BaseParser):
                         'cpu_req': 8,
                         'gpu_req': 1,
                         'io_time_ms': 0.0,
-                        'compute_time_ms': row.compute_time_ms
+                        'compute_time_ms': max(10.0, row.compute_time_ms)  # 保底 10ms 运算
                     }
+
 
 class AlibabaParser(BaseParser):
     def parse(self) -> Generator[Dict[str, Any], None, None]:
-        # Process requests and randomly assign an IO wait from basemodel if needed
-        # In a real scenario, this might need matching, but let's sample or assume
-        # For simplicity, we just yield requests.
         req_filepath = self.get_file_path('*lora_request_trace.csv')
         io_filepath = self.get_file_path('*basemodel_update_latency_anon.csv')
 
-        # Load IO times safely with chunking to avoid OOM
         io_times = []
         if io_filepath:
             try:
                 for chunk in self.read_csv_in_chunks(io_filepath):
                     io_times.extend(chunk['value'].dropna().tolist())
             except Exception as e:
-                print(f"Error loading IO times safely: {e}")
+                print(f"  [Error] 加载 Alibaba IO 数据异常: {e}")
 
         io_idx = 0
         io_len = len(io_times)
@@ -84,12 +97,10 @@ class AlibabaParser(BaseParser):
             return
 
         for chunk in self.read_csv_in_chunks(req_filepath):
-            # 【极速解析】Alibaba 的 gmt_create
             chunk['gmt_create'] = pd.to_datetime(chunk['gmt_create'], format='mixed', cache=True, errors='coerce')
             chunk = chunk.dropna(subset=['gmt_create'])
-
-            # 使用 itertuples 提速（如果你之前没改这个 parser 的话）
             chunk['timestamp_ms'] = chunk['gmt_create'].astype('int64') // 10 ** 6
+
             for row in chunk.itertuples(index=False):
                 e2e_time_ms = float(row.exec_time_seconds) * 1000.0
                 io_time_ms = 0.0
@@ -108,15 +119,6 @@ class AlibabaParser(BaseParser):
                 }
 
 
-import json
-from datetime import datetime
-import os
-
-import json
-from datetime import datetime
-import os
-
-
 class PhillyParser(BaseParser):
     def parse(self):
         filepath = self.get_file_path('*Philly_cluster_job_log*')
@@ -128,7 +130,6 @@ class PhillyParser(BaseParser):
         parsed_count = 0
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
-                # 1. 快速寻找数组开头 '['
                 char = f.read(1)
                 while char and char != '[':
                     char = f.read(1)
@@ -139,30 +140,25 @@ class PhillyParser(BaseParser):
                 buffer = ""
                 decoder = json.JSONDecoder()
 
-                # 2. 建立 512KB 的极速滑动窗口
                 while True:
                     chunk = f.read(1024 * 512)
                     if not chunk and not buffer.strip():
                         break
                     buffer += chunk
 
-                    # 3. 疯狂提取完整的 JSON 对象
                     while True:
                         buffer = buffer.lstrip(', \n\r\t')
                         if not buffer:
                             break
                         if buffer.startswith(']'):
-                            # 【核心修复2】完美识别 JSON 数组结束符，直接终结生成器，防止文件末尾死循环
                             return
 
                         try:
-                            # 极速切除合法的 JSON 字典
                             job, idx = decoder.raw_decode(buffer)
                             buffer = buffer[idx:]
                         except json.JSONDecodeError:
-                            break  # 缓冲区数据不完整，去读下一块
+                            break
 
-                        # === 【新增：内层防弹装甲】 ===
                         try:
                             parsed_count += 1
                             if parsed_count == 1:
@@ -173,17 +169,19 @@ class PhillyParser(BaseParser):
                                 continue
 
                             attempt = attempts[0]
-                            # 强转为字符串，防止取到真实的 Python None
                             start_str = str(attempt.get('start_time', ''))
                             end_str = str(attempt.get('end_time', ''))
 
-                            # 【核心修复】拦截 'None', 'null', 'NaN' 或空值
                             if not start_str or not end_str or start_str.lower() in ['none', 'null', 'nan',
                                                                                      ''] or end_str.lower() in ['none',
                                                                                                                 'null',
                                                                                                                 'nan',
                                                                                                                 '']:
                                 continue
+
+                            # 【核心修复2】拆除毫秒级时间炸弹！兼容 "2017-10-03 14:00:00.123" 这种带小数的异常格式
+                            start_str = start_str.split('.')[0].replace('T', ' ').strip()
+                            end_str = end_str.split('.')[0].replace('T', ' ').strip()
 
                             start_dt = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
                             end_dt = datetime.strptime(end_str, "%Y-%m-%d %H:%M:%S")
@@ -202,17 +200,17 @@ class PhillyParser(BaseParser):
                                 'cpu_req': gpu_req * 8,
                                 'gpu_req': gpu_req,
                                 'io_time_ms': 0.0,
-                                'compute_time_ms': max(0.0, duration_sec * 1000.0)
+                                'compute_time_ms': max(100.0, duration_sec * 1000.0)  # 防止计算时间为0引发无穷尽分配
                             }
                         except Exception as inner_e:
-                            # 【核心护盾】无论这条数据里的时间格式有多离谱，静默吞掉异常，继续解析下一条！
                             continue
 
                     if not chunk:
                         break
 
         except Exception as e:
-            print(f"Error reading Philly JSON: {e}")
+            print(f"  [Error] reading Philly JSON: {e}")
+
 
 class DlrmParser(BaseParser):
     def parse(self) -> Generator[Dict[str, Any], None, None]:
@@ -220,7 +218,6 @@ class DlrmParser(BaseParser):
         if not filepath:
             return
         for chunk in self.read_csv_in_chunks(filepath):
-            # 过滤刺客任务
             dlrm_chunk = chunk[chunk['request_type'] == 'API Requests']
             for row in dlrm_chunk.itertuples(index=False):
                 yield {
@@ -259,7 +256,6 @@ def event_generator(data_dir: str, include_dlrm: bool = True) -> Generator[Dict[
         try:
             item = next(p)
             stream_offsets[i] = item['timestamp_ms']
-            # 折叠：所有数据源的起始时间都归零
             aligned_ts = 0.0
             heapq.heappush(pq, (aligned_ts, i, item))
         except StopIteration:
@@ -267,15 +263,11 @@ def event_generator(data_dir: str, include_dlrm: bool = True) -> Generator[Dict[
 
     print(f"  [EventGen] 成功锚定 {len(pq)} 个数据流，开始对齐任务时间轴...")
 
-
     processed_count = 0
-    # 2. 循环阶段
-    # ... 在 event_generator 内部 ...
     while pq:
         aligned_ts, idx, item = heapq.heappop(pq)
 
         if processed_count == 0:
-            # 强制刷新缓冲区！
             print(f"  [EventGen] ⚡ 第一条数据已成功进入归并逻辑！Idx={idx}, Time={aligned_ts}", flush=True)
 
         processed_count += 1
@@ -286,9 +278,9 @@ def event_generator(data_dir: str, include_dlrm: bool = True) -> Generator[Dict[
         yield item
 
         try:
-            # 【核心排查点】：如果我们卡在这里，说明 next(parsers[idx]) 永远无法返回
             next_item = next(parsers[idx])
             next_aligned_ts = next_item['timestamp_ms'] - stream_offsets[idx]
+            # 【核心护盾】强制时间轴单调递增，防止某个文件的脏数据时间倒流击穿仿真器
             next_aligned_ts = max(aligned_ts, next_aligned_ts)
             heapq.heappush(pq, (next_aligned_ts, idx, next_item))
         except StopIteration:
