@@ -50,6 +50,7 @@ class AzureParser(BaseParser):
                 # 【极速解析】开启 cache，遇到乱码行直接跳过，然后删掉无效行
                 chunk['TIMESTAMP'] = pd.to_datetime(chunk['TIMESTAMP'], format='mixed', cache=True, errors='coerce')
                 chunk = chunk.dropna(subset=['TIMESTAMP'])
+                chunk = chunk.sort_values(by='TIMESTAMP')
 
                 chunk['timestamp_ms'] = chunk['TIMESTAMP'].astype('int64') // 10 ** 6
 
@@ -279,13 +280,17 @@ def event_generator(data_dir: str, include_dlrm: bool = True) -> Generator[Dict[
 
         try:
             next_item = next(parsers[idx])
-            next_aligned_ts = next_item['timestamp_ms'] - stream_offsets[idx]
-            # 【核心护盾】强制时间轴单调递增，防止某个文件的脏数据时间倒流击穿仿真器
-            next_aligned_ts = max(aligned_ts, next_aligned_ts)
+            raw_next_ts = next_item['timestamp_ms'] - stream_offsets[idx]
+
+            # 【修复点】探测到时间倒流（如切换到了新文件、或者 CSV 内部大范围乱序）
+            if raw_next_ts < aligned_ts:
+                # 动态自适应：重新校准该流的偏移锚点，让新文件的时间紧挨着当前时间自然推进
+                stream_offsets[idx] = next_item['timestamp_ms'] - aligned_ts
+                next_aligned_ts = aligned_ts
+            else:
+                next_aligned_ts = raw_next_ts
+
             heapq.heappush(pq, (next_aligned_ts, idx, next_item))
         except StopIteration:
             print(f"  [EventGen] 数据流 {idx} 已耗尽。")
-            continue
-        except Exception as e:
-            print(f"  [EventGen] 数据流 {idx} 在读取下一条时发生异常: {e}")
             continue
