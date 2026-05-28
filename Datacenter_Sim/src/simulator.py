@@ -35,8 +35,8 @@ class Node:
         # Since minimum CPU request is 4, < 4 means no other GPU tasks can be scheduled.
         return (self.total_cpus - self.used_cpus) < 4 and (self.total_gpus - self.used_gpus) > 0
 
-
 import simpy
+from collections import deque  # 引入双端队列
 from typing import Dict, Any, List, Optional
 from .energy_model import HardwareEnergyTracker
 
@@ -75,45 +75,40 @@ class ClusterResourceManager:
         self.task_energies = {'LLM': [], 'Diffusion': [], 'DLRM': [], 'Training': []}
         self.task_counts = {'LLM': 0, 'Diffusion': 0, 'DLRM': 0, 'Training': 0}
 
-        # 【核心创新 1】上帝视角全局资源池：O(1) 的拦截盾，避免遍历整个集群
         self.cluster_free_cpus = num_nodes * cpus_per_node
         self.cluster_free_gpus = num_nodes * gpus_per_node
 
-        # 【核心创新 2】中央调度队列与守护进程
-        self.pending_queue = []
+        # 【修复 1】将普通列表改为高效的双端队列
+        self.pending_queue = deque()
         self.trigger_schedule = self.env.event()
         self.env.process(self.scheduler_daemon())
 
     def scheduler_daemon(self):
-        """Kube-Scheduler 级中央守护进程，引入极速 O(1) 熔断剪枝机制"""
+        """Kube-Scheduler 级中央守护进程，结合 Backfill 限深扫描"""
+        MAX_SCAN_DEPTH = 200  # 【修复 2】熔断上限：每次唤醒最多扫描前 200 个任务，防 O(N^2) 风暴
+
         while True:
-            # 只有当有新任务到来或有资源释放时，调度器才苏醒
             yield self.trigger_schedule
             self.trigger_schedule = self.env.event()
 
-            # 【神级优化 1：开门见山】如果集群已经没有 GPU 了，直接睡大觉，看都不看排队的 100 万个任务！
-            if self.cluster_free_gpus == 0:
+            # 全局 GPU 枯竭或队列为空，直接休眠
+            if self.cluster_free_gpus == 0 or not self.pending_queue:
                 continue
 
-            new_pending = []
-            # 使用 enumerate 方便我们进行极速列表切片
-            for i, req in enumerate(self.pending_queue):
+            unallocated = []
+            scan_count = 0
 
-                # 【神级优化 2：早停熔断 (Early Exit)】
-                # 如果在给前面的任务分配资源时，GPU 刚好被分配光了，
-                # 立刻把剩下的所有任务原封不动塞回新队列，并直接跳出循环！彻底消灭 O(N^2) 死亡螺旋！
-                if self.cluster_free_gpus == 0:
-                    new_pending.extend(self.pending_queue[i:])
-                    break
-
+            # 仅当有 GPU 且队列有任务且未达到扫描上限时执行
+            while self.pending_queue and self.cluster_free_gpus > 0 and scan_count < MAX_SCAN_DEPTH:
+                req = self.pending_queue.popleft()  # O(1) 弹出
+                scan_count += 1
                 task, allocated_event, req_c, req_g = req
 
-                # 如果全局剩余资源都不够这个任务，跳过
+                # 如果全局资源不足以满足该任务，暂时搁置
                 if self.cluster_free_cpus < req_c or self.cluster_free_gpus < req_g:
-                    new_pending.append(req)
+                    unallocated.append(req)
                     continue
 
-                # 集群总量够，进行原子化 Gang Scheduling 节点碎片扫描
                 temp_allocations = []
                 rem_c, rem_g = req_c, req_g
 
@@ -131,19 +126,22 @@ class ClusterResourceManager:
                         rem_g -= alloc_g
 
                 if rem_c == 0 and rem_g == 0:
-                    # 彻底凑齐！提交资源事务
                     for n, c, g in temp_allocations:
                         n.allocate(c, g)
                         self.cluster_free_cpus -= c
                         self.cluster_free_gpus -= g
-                    # 唤醒这一个分配成功的任务
                     allocated_event.succeed(temp_allocations)
                 else:
-                    # 碎片化严重凑不齐，继续排队
-                    new_pending.append(req)
+                    unallocated.append(req)
 
-            # 更新排队队列
-            self.pending_queue = new_pending
+            # 【修复 3】将未分配的任务原路塞回队首，维持优先级顺序 (O(k) 操作，极速)
+            for req in reversed(unallocated):
+                self.pending_queue.appendleft(req)
+
+            # 如果队列还有剩余且由于 MAX_SCAN 退出，稍后再次自我唤醒以消化剩余任务
+            if self.pending_queue and self.cluster_free_gpus > 0:
+                if not self.trigger_schedule.triggered:
+                    self.trigger_schedule.succeed()
 
     def process_task(self, task: Dict[str, Any]):
         import math
