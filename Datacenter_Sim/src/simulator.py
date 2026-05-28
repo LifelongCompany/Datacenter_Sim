@@ -130,6 +130,7 @@ class ClusterResourceManager:
             self.tracker.record_power_state(self.env.now, active_gpus, io_blocked_nodes, stranded_nodes)
             yield self.env.timeout(1000.0) # snapshot every 1 second
 
+
 def process_events(env: simpy.Environment, cluster: ClusterResourceManager, event_stream):
     last_event_time = 0.0
     tasks_done = simpy.Store(env)
@@ -140,7 +141,7 @@ def process_events(env: simpy.Environment, cluster: ClusterResourceManager, even
         tasks_done.put(1)
 
     print("  [Simulator] 开始读取日志并注入事件流，请稍候...")
-    
+
     # 1. 注入事件阶段的进度监控
     for task in event_stream:
         wait_time = task['relative_time_ms'] - last_event_time
@@ -154,7 +155,7 @@ def process_events(env: simpy.Environment, cluster: ClusterResourceManager, even
 
         # 【新增】每处理 10万 条数据，打印一次当前进度与模拟时间
         if total_dispatched % 100000 == 0:
-            sim_hours = env.now / (1000.0 * 60 * 60) # 将毫秒转换为小时
+            sim_hours = env.now / (1000.0 * 60 * 60)  # 将毫秒转换为小时
             print(f"  [Progress] 已注入 {total_dispatched} 个请求... 当前模拟器时间: 第 {sim_hours:.2f} 小时")
 
     print(f"  [Simulator] 所有 {total_dispatched} 个请求已全部注入！等待集群消化剩余任务...")
@@ -164,9 +165,9 @@ def process_events(env: simpy.Environment, cluster: ClusterResourceManager, even
     for _ in range(total_dispatched):
         yield tasks_done.get()
         completed += 1
-        
+
         # 【新增】每完成 10万 个任务，打印一次消化进度
-        if completed % 100000 == 0:
+        if completed % 10000 == 0:
             print(f"  [Finishing] 集群已处理完毕 {completed} / {total_dispatched} 个任务...")
 
 def run_simulation(env: simpy.Environment, event_stream, duration_ms: float = None) -> ClusterResourceManager:
