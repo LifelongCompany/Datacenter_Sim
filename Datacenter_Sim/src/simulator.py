@@ -41,7 +41,6 @@ from typing import Dict, Any, List, Optional
 from .energy_model import HardwareEnergyTracker
 
 
-# (保留原来的 Node 类不动...)
 class Node:
     def __init__(self, node_id: int, total_cpus: int, total_gpus: int):
         self.node_id = node_id
@@ -51,10 +50,6 @@ class Node:
         self.used_gpus = 0
         self.active_tasks = 0
         self.io_blocked_tasks = 0
-
-    def can_allocate(self, cpu_req: int, gpu_req: int) -> bool:
-        return (self.total_cpus - self.used_cpus) >= cpu_req and \
-            (self.total_gpus - self.used_gpus) >= gpu_req
 
     def allocate(self, cpu_req: int, gpu_req: int):
         self.used_cpus += cpu_req
@@ -80,85 +75,122 @@ class ClusterResourceManager:
         self.task_energies = {'LLM': [], 'Diffusion': [], 'DLRM': [], 'Training': []}
         self.task_counts = {'LLM': 0, 'Diffusion': 0, 'DLRM': 0, 'Training': 0}
 
-        # 【核心护盾1】条件变量锁：取代死循环 Polling，防止 CPU 卡死
-        self.resource_freed_event = self.env.event()
+        # 【核心创新 1】上帝视角全局资源池：O(1) 的拦截盾，避免遍历整个集群
+        self.cluster_free_cpus = num_nodes * cpus_per_node
+        self.cluster_free_gpus = num_nodes * gpus_per_node
 
-    def allocate(self, cpu_req: int, gpu_req: int) -> Optional[Node]:
-        for node in self.nodes:
-            if node.can_allocate(cpu_req, gpu_req):
-                node.allocate(cpu_req, gpu_req)
-                return node
-        return None
+        # 【核心创新 2】中央调度队列与守护进程
+        self.pending_queue = []
+        self.trigger_schedule = self.env.event()
+        self.env.process(self.scheduler_daemon())
 
-    def release(self, node: Node, cpu_req: int, gpu_req: int):
-        node.release(cpu_req, gpu_req)
-        # 只要有任何资源释放，立刻触发事件，全局广播唤醒所有处于饥饿排队中的任务
-        if not self.resource_freed_event.triggered:
-            self.resource_freed_event.succeed()
-            self.resource_freed_event = self.env.event()
-
-    def process_task(self, task: Dict[str, Any]):
-        nodes_needed = []
-
-        # 【安全截断】防止单个异常长尾任务（如需求 1000 卡）超过集群总和导致全盘死锁
-        max_cluster_cpus = sum(n.total_cpus for n in self.nodes)
-        max_cluster_gpus = sum(n.total_gpus for n in self.nodes)
-        req_cpus = min(task['cpu_req'], max_cluster_cpus)
-        req_gpus = min(task['gpu_req'], max_cluster_gpus)
-
-        # 【核心护盾2】原子级事务分配（All-or-Nothing）彻底封杀分布式死锁
+    def scheduler_daemon(self):
+        """Kube-Scheduler 级中央守护进程，引入极速 O(1) 熔断剪枝机制"""
         while True:
-            remaining_cpus = req_cpus
-            remaining_gpus = req_gpus
-            temp_allocations = []
+            # 只有当有新任务到来或有资源释放时，调度器才苏醒
+            yield self.trigger_schedule
+            self.trigger_schedule = self.env.event()
 
-            # 模拟 Gang Scheduling：遍历集群搜集一切可用碎片
-            for node in self.nodes:
-                if remaining_cpus <= 0 and remaining_gpus <= 0:
+            # 【神级优化 1：开门见山】如果集群已经没有 GPU 了，直接睡大觉，看都不看排队的 100 万个任务！
+            if self.cluster_free_gpus == 0:
+                continue
+
+            new_pending = []
+            # 使用 enumerate 方便我们进行极速列表切片
+            for i, req in enumerate(self.pending_queue):
+
+                # 【神级优化 2：早停熔断 (Early Exit)】
+                # 如果在给前面的任务分配资源时，GPU 刚好被分配光了，
+                # 立刻把剩下的所有任务原封不动塞回新队列，并直接跳出循环！彻底消灭 O(N^2) 死亡螺旋！
+                if self.cluster_free_gpus == 0:
+                    new_pending.extend(self.pending_queue[i:])
                     break
 
-                avail_c = node.total_cpus - node.used_cpus
-                avail_g = node.total_gpus - node.used_gpus
+                task, allocated_event, req_c, req_g = req
 
-                alloc_c = min(remaining_cpus, avail_c)
-                alloc_g = min(remaining_gpus, avail_g)
+                # 如果全局剩余资源都不够这个任务，跳过
+                if self.cluster_free_cpus < req_c or self.cluster_free_gpus < req_g:
+                    new_pending.append(req)
+                    continue
 
-                if alloc_c > 0 or alloc_g > 0:
-                    temp_allocations.append((node, alloc_c, alloc_g))
-                    remaining_cpus -= alloc_c
-                    remaining_gpus -= alloc_g
+                # 集群总量够，进行原子化 Gang Scheduling 节点碎片扫描
+                temp_allocations = []
+                rem_c, rem_g = req_c, req_g
 
-            # 检查是否满足了所有需求
-            if remaining_cpus == 0 and remaining_gpus == 0:
-                # 彻底凑齐！执行真实分配（提交事务）
-                for n, c, g in temp_allocations:
-                    n.allocate(c, g)
-                    nodes_needed.append((n, c, g))
-                break  # 跳出资源获取循环，进入计算阶段
-            else:
-                # 【破局点】如果没凑齐，决不能持有已预占的资源死等！
-                # 放弃所有临时预占，通过 Yield 将自身彻底挂起（0 CPU消耗），直到集群有人释放资源才被唤醒重试
-                yield self.resource_freed_event
+                for node in self.nodes:
+                    if rem_c <= 0 and rem_g <= 0: break
+                    avail_c = node.total_cpus - node.used_cpus
+                    avail_g = node.total_gpus - node.used_gpus
 
-        # 1. I/O Block Cold Start Penalty
-        io_time = task['io_time_ms']
+                    alloc_c = min(rem_c, avail_c)
+                    alloc_g = min(rem_g, avail_g)
+
+                    if alloc_c > 0 or alloc_g > 0:
+                        temp_allocations.append((node, alloc_c, alloc_g))
+                        rem_c -= alloc_c
+                        rem_g -= alloc_g
+
+                if rem_c == 0 and rem_g == 0:
+                    # 彻底凑齐！提交资源事务
+                    for n, c, g in temp_allocations:
+                        n.allocate(c, g)
+                        self.cluster_free_cpus -= c
+                        self.cluster_free_gpus -= g
+                    # 唤醒这一个分配成功的任务
+                    allocated_event.succeed(temp_allocations)
+                else:
+                    # 碎片化严重凑不齐，继续排队
+                    new_pending.append(req)
+
+            # 更新排队队列
+            self.pending_queue = new_pending
+
+    def process_task(self, task: Dict[str, Any]):
+        import math
+        raw_cpu = task.get('cpu_req', 0)
+        raw_gpu = task.get('gpu_req', 0)
+
+        if raw_cpu is None or (isinstance(raw_cpu, float) and math.isnan(raw_cpu)): raw_cpu = 0
+        if raw_gpu is None or (isinstance(raw_gpu, float) and math.isnan(raw_gpu)): raw_gpu = 0
+
+        max_c = sum(n.total_cpus for n in self.nodes)
+        max_g = sum(n.total_gpus for n in self.nodes)
+
+        req_cpus = max(0, min(int(raw_cpu), max_c))
+        req_gpus = max(0, min(int(raw_gpu), max_g))
+
+        if req_cpus == 0 and req_gpus == 0:
+            io_time = task.get('io_time_ms', 0)
+            compute_time = task.get('compute_time_ms', 0)
+            if io_time > 0: yield self.env.timeout(io_time)
+            if compute_time > 0: yield self.env.timeout(compute_time)
+            t_type = task.get('type', 'LLM')
+            if t_type in self.task_counts: self.task_counts[t_type] += 1
+            return
+
+        # 任务注册到中央调度器，然后挂起睡觉，绝不消耗任何 CPU 算力
+        allocated_event = self.env.event()
+        self.pending_queue.append((task, allocated_event, req_cpus, req_gpus))
+
+        if not self.trigger_schedule.triggered:
+            self.trigger_schedule.succeed()
+
+        # 【核心】在这里乖乖睡觉，等中央调度器把节点塞到手里才醒来！
+        nodes_needed = yield allocated_event
+
+        # ----------- 任务执行与能耗统计阶段 -----------
+        io_time = task.get('io_time_ms', 0)
         if io_time > 0:
-            for n, _, _ in nodes_needed:
-                n.io_blocked_tasks += 1
+            for n, _, _ in nodes_needed: n.io_blocked_tasks += 1
             yield self.env.timeout(io_time)
-            for n, _, _ in nodes_needed:
-                n.io_blocked_tasks -= 1
+            for n, _, _ in nodes_needed: n.io_blocked_tasks -= 1
 
-        # 2. Active Compute
-        compute_time = task['compute_time_ms']
+        compute_time = task.get('compute_time_ms', 0)
         if compute_time > 0:
-            for n, _, _ in nodes_needed:
-                n.active_tasks += 1
+            for n, _, _ in nodes_needed: n.active_tasks += 1
             yield self.env.timeout(compute_time)
-            for n, _, _ in nodes_needed:
-                n.active_tasks -= 1
+            for n, _, _ in nodes_needed: n.active_tasks -= 1
 
-            # 能耗计算与统筹
             task_energy_j = 0.0
             for n, alloc_c, alloc_g in nodes_needed:
                 node_fraction = max(alloc_g / n.total_gpus, alloc_c / n.total_cpus)
@@ -167,26 +199,40 @@ class ClusterResourceManager:
                 eng += (self.tracker.p_static * node_fraction) * (io_time / 1000.0)
                 task_energy_j += eng
 
-            # 蓄水池采样防绘图时 OOM 内存爆炸
-            if len(self.task_energies[task['type']]) < 100000:
-                self.task_energies[task['type']].append(task_energy_j)
+            t_type = task.get('type', 'LLM')
+            if len(self.task_energies[t_type]) < 100000:
+                self.task_energies[t_type].append(task_energy_j)
             else:
                 import random
-                idx = random.randint(0, self.task_counts[task['type']])
+                idx = random.randint(0, self.task_counts[t_type])
                 if idx < 100000:
-                    self.task_energies[task['type']][idx] = task_energy_j
+                    self.task_energies[t_type][idx] = task_energy_j
 
-        # 3. 释放资源并触发全局广播唤醒（唤醒其他处于 yield self.resource_freed_event 的任务）
+        # ----------- 资源释放与唤醒调度器 -----------
         for n, alloc_c, alloc_g in nodes_needed:
-            self.release(n, alloc_c, alloc_g)
-        self.task_counts[task['type']] += 1
+            n.release(alloc_c, alloc_g)
+            self.cluster_free_cpus += alloc_c
+            self.cluster_free_gpus += alloc_g
+
+        self.task_counts[task.get('type', 'LLM')] += 1
+
+        # 资源释放完毕，踢一脚中央调度器去处理排队的兄弟
+        if not self.trigger_schedule.triggered:
+            self.trigger_schedule.succeed()
 
     def monitor_power_process(self):
-        # 周期性为集群耗电做状态快照
+        """
+        [能耗监控探头]
+        后台守护进程：周期性为集群耗电做状态快照，这是对标《Joule》顶刊图表的核心数据源！
+        """
         while True:
+            # 统计真正干活的 GPU 数量
             active_gpus = sum(n.used_gpus for n in self.nodes)
+
+            # 统计因加载模型而陷入 I/O 阻塞的节点数（冷启动惩罚）
             io_blocked_nodes = sum(1 for n in self.nodes if n.io_blocked_tasks > 0)
 
+            # 统计被“搁浅”的节点和 GPU 数量（硬件错配导致的隐性能耗）
             stranded_nodes = 0
             stranded_gpus = 0
             for n in self.nodes:
@@ -194,10 +240,13 @@ class ClusterResourceManager:
                     stranded_nodes += 1
                     stranded_gpus += (n.total_gpus - n.used_gpus)
 
+            # 将当前状态写入打点器
             self.tracker.record_power_state(self.env.now, active_gpus, io_blocked_nodes, stranded_nodes)
-            # 【核心护盾3】从每秒 1 次（1000.0）放宽到每 10 秒次（10000.0）快照
-            # 大幅减少数百万次无意义的协程切换，提升引擎长尾推进速度
+
+            # 每 10 秒（10000 毫秒）做一次切片采样。
+            # 这里设置 10 秒既能保证宏观曲线平滑，又不会给 SimPy 引擎带来过高的事件开销。
             yield self.env.timeout(10000.0)
+
 
 
 def process_events(env: simpy.Environment, cluster: ClusterResourceManager, event_stream):
