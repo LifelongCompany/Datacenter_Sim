@@ -69,38 +69,56 @@ class ClusterResourceManager:
         node.release(cpu_req, gpu_req)
 
     def process_task(self, task: Dict[str, Any]):
-        # Wait until resources are available
-        # In a real cluster, tasks queue up. We will retry periodically if no resources.
-        node = None
-        while node is None:
-            node = self.allocate(task['cpu_req'], task['gpu_req'])
-            if node is None:
-                # Wait a bit and retry
-                yield self.env.timeout(100.0) # 100ms
+        # 【核心修复1】支持超大型分布式训练任务（跨节点拆分分配）
+        # 解决 Philly 数据集中单任务请求 > 8 GPUs 导致的永久死锁问题
+        nodes_needed = []
+        remaining_cpus = task['cpu_req']
+        remaining_gpus = task['gpu_req']
 
-        # 1. I/O Block Cold Start Penalty
+        while remaining_cpus > 0 or remaining_gpus > 0:
+            # 贪心拆分：如果需求大于单机最大容量，则截断分配到多台机器
+            alloc_cpu = min(remaining_cpus, self.nodes[0].total_cpus)
+            alloc_gpu = min(remaining_gpus, self.nodes[0].total_gpus)
+
+            node = None
+            while node is None:
+                node = self.allocate(alloc_cpu, alloc_gpu)
+                if node is None:
+                    # 降低退避重试频率至1000ms，极大减轻 SimPy 事件循环压力
+                    yield self.env.timeout(1000.0)
+
+            nodes_needed.append((node, alloc_cpu, alloc_gpu))
+            remaining_cpus -= alloc_cpu
+            remaining_gpus -= alloc_gpu
+
+        # 1. I/O Block Cold Start Penalty (同步阻塞所有分配到的机器)
         io_time = task['io_time_ms']
         if io_time > 0:
-            node.io_blocked_tasks += 1
+            for n, _, _ in nodes_needed:
+                n.io_blocked_tasks += 1
             yield self.env.timeout(io_time)
-            node.io_blocked_tasks -= 1
+            for n, _, _ in nodes_needed:
+                n.io_blocked_tasks -= 1
 
-        # 2. Active Compute
+        # 2. Active Compute (真实消耗计算时间)
         compute_time = task['compute_time_ms']
         if compute_time > 0:
-            node.active_tasks += 1
+            for n, _, _ in nodes_needed:
+                n.active_tasks += 1
             yield self.env.timeout(compute_time)
-            node.active_tasks -= 1
+            for n, _, _ in nodes_needed:
+                n.active_tasks -= 1
 
-            # [León-Vega et al., 2024] - Energy slicing rule: Assign fraction of static power
-            node_fraction = max(task['gpu_req'] / node.total_gpus, task['cpu_req'] / node.total_cpus)
+            # 【精准量化】跨多节点合并计算“隐性能耗”与“动态能耗”
+            task_energy_j = 0.0
+            for n, alloc_c, alloc_g in nodes_needed:
+                node_fraction = max(alloc_g / n.total_gpus, alloc_c / n.total_cpus)
+                eng = (alloc_g * self.tracker.p_dynamic_gpu + self.tracker.p_static * node_fraction) * (
+                            compute_time / 1000.0)
+                eng += (self.tracker.p_static * node_fraction) * (io_time / 1000.0)
+                task_energy_j += eng
 
-            # Record single task total energy for violin plot
-            # (Energy = P * T). Active + I/O wasted energy for this task. Time is ms so divide by 1000.0
-            task_energy_j = (task['gpu_req'] * self.tracker.p_dynamic_gpu + self.tracker.p_static * node_fraction) * (compute_time / 1000.0)
-            task_energy_j += (self.tracker.p_static * node_fraction) * (io_time / 1000.0)
-
-            # Reservoir sample task energies to prevent OOM
+            # 使用蓄水池抽样防止绘图时 OOM 内存爆炸
             if len(self.task_energies[task['type']]) < 100000:
                 self.task_energies[task['type']].append(task_energy_j)
             else:
@@ -109,8 +127,9 @@ class ClusterResourceManager:
                 if idx < 100000:
                     self.task_energies[task['type']][idx] = task_energy_j
 
-        # Release resources
-        self.release(node, task['cpu_req'], task['gpu_req'])
+        # 3. 释放所有机器资源
+        for n, alloc_c, alloc_g in nodes_needed:
+            self.release(n, alloc_c, alloc_g)
         self.task_counts[task['type']] += 1
 
     def monitor_power_process(self):
@@ -155,8 +174,9 @@ def process_events(env: simpy.Environment, cluster: ClusterResourceManager, even
 
         # 【新增】每处理 10万 条数据，打印一次当前进度与模拟时间
         if total_dispatched % 100000 == 0:
-            sim_hours = env.now / (1000.0 * 60 * 60)  # 将毫秒转换为小时
-            print(f"  [Progress] 已注入 {total_dispatched} 个请求... 当前模拟器时间: 第 {sim_hours:.2f} 小时")
+            sim_hours = env.now / (1000.0 * 60 * 60)
+            print(f"  [Progress] 已注入 {total_dispatched} 个请求... 当前模拟器时间: 第 {sim_hours:.2f} 小时",
+                  flush=True)
 
     print(f"  [Simulator] 所有 {total_dispatched} 个请求已全部注入！等待集群消化剩余任务...")
 
