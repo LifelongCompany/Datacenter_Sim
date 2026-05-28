@@ -149,8 +149,11 @@ class PhillyParser(BaseParser):
                     # 3. 疯狂提取完整的 JSON 对象
                     while True:
                         buffer = buffer.lstrip(', \n\r\t')
-                        if not buffer or buffer.startswith(']'):
+                        if not buffer:
                             break
+                        if buffer.startswith(']'):
+                            # 【核心修复2】完美识别 JSON 数组结束符，直接终结生成器，防止文件末尾死循环
+                            return
 
                         try:
                             # 极速切除合法的 JSON 字典
@@ -267,16 +270,17 @@ def event_generator(data_dir: str, include_dlrm: bool = True) -> Generator[Dict[
 
     processed_count = 0
     # 2. 循环阶段
+    # ... 在 event_generator 内部 ...
     while pq:
         aligned_ts, idx, item = heapq.heappop(pq)
 
-        # 【新增：极其关键的监控点】
         if processed_count == 0:
-            print(f"  [EventGen] ⚡ 第一条数据已成功进入归并逻辑！Idx={idx}, Time={aligned_ts}")
+            # 强制刷新缓冲区！
+            print(f"  [EventGen] ⚡ 第一条数据已成功进入归并逻辑！Idx={idx}, Time={aligned_ts}", flush=True)
 
         processed_count += 1
         if processed_count % 10000 == 0:
-            print(f"  [EventGen] 进度反馈... 已归并: {processed_count} 个任务")
+            print(f"  [EventGen] 进度反馈... 已归并: {processed_count} 个任务", flush=True)
 
         item['relative_time_ms'] = aligned_ts
         yield item
